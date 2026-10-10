@@ -1,0 +1,30 @@
+name: Vinted
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+concurrency:
+  group: vinted
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests pillow
+      - uses: actions/cache/restore@v4
+        with:
+          path: vinted.db
+          key: vinted-db-${{ github.run_id }}
+          restore-keys: vinted-db-
+      - run: python vinted_sniper.py --once
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: vinted.db
+          key: vinted-db-${{ github.run_id }}

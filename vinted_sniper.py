@@ -189,6 +189,19 @@ def init_db():
                 score REAL, reasons TEXT, source TEXT, url TEXT, photo TEXT);
             """
         )
+        # Einmaliger Reset (v2): alte "schon gesehen"-Stände verwerfen
+        if c.execute("SELECT 1 FROM seeded WHERE label='schema-v2'").fetchone() is None:
+            c.execute("DELETE FROM seeded")
+            c.execute("DELETE FROM seen")
+            c.execute("INSERT INTO seeded VALUES ('schema-v2')")
+
+
+def send_status(title, message, tag="white_check_mark"):
+    try:
+        requests.post(NTFY_SERVER, json={"topic": NTFY_TOPIC, "title": title, "message": message,
+                                         "tags": [tag]}, timeout=15)
+    except Exception as e:
+        LOG.warning("Status-Push fehlgeschlagen: %s", e)
 
 
 def is_seen(iid):
@@ -556,30 +569,50 @@ def search_runs(search):
 
 def scan_once(v):
     STATS["status"] = "scannt"
+    runs = total_returned = seeded_now = 0
     for search in SEARCHES:
         if search.get("enabled", True) is False:
             continue
         for label, params, cq in search_runs(search):
+            runs += 1
             data = v.get_json("/api/v2/catalog/items", params)
-            items = data.get("items", [])
+            items = data.get("items", []) if isinstance(data, dict) else []
+            total_returned += len(items)
             full_label = f"{search['name']}|{label}"
             seeded = is_seeded(full_label)   # erster Lauf: nur speichern, nicht pushen
+            new_items = passing = 0
+            if not items:
+                LOG.warning("Leere Antwort für '%s' (Felder: %s)", full_label,
+                            list(data)[:8] if isinstance(data, dict) else type(data).__name__)
             for item in items:
                 iid = str(item.get("id"))
                 if not item.get("id") or is_seen(iid):
                     continue
+                new_items += 1
                 mark_seen(iid)
                 STATS["checked"] += 1
+                price = parse_price(item)
+                if MIN_PRICE <= price < INF and passes_filters(item, search):
+                    passing += 1
                 try:
                     process_item(v, search, item, cq, push=seeded)
                 except Blocked:
                     raise
                 except Exception:
                     LOG.exception("Fehler bei Inserat %s", iid)
-            if not seeded:
+            LOG.info("%s: %d Inserate gelesen, %d neu, %d passen zu deinen Filtern",
+                     full_label, len(items), new_items, passing)
+            if not seeded and items:
                 mark_seeded(full_label)
+                seeded_now += 1
                 LOG.info("Erster Durchlauf '%s' – bisherige Inserate ohne Push erfasst", full_label)
             time.sleep(random.uniform(2, 5))
+    if runs and total_returned == 0:
+        raise Blocked("Vinted liefert nur leere Antworten (vermutlich Bot-Schutz)")
+    if seeded_now:
+        send_status("Vinted-Finder läuft",
+                    f"{total_returned} Inserate gelesen, {STATS['finds']} Schnäppchen schon erfasst. "
+                    "Ab jetzt kommen Alarme bei neuen Treffern.")
     STATS["scans"] += 1
     STATS["last_scan"] = datetime.now().strftime("%H:%M:%S")
     STATS["status"] = "ok"
